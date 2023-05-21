@@ -146,6 +146,10 @@ public class FYVideoCompressor {
     /// Custom quality will not be affected by this value.
     static public var minimumVideoBitrate = 1000 * 200
     
+    public func cancel() {
+        self.isCancelled = true
+    }
+    
     /// Compress Video with quality.
     
     /// Compress Video with quality.
@@ -313,7 +317,17 @@ public class FYVideoCompressor {
             compressVideoPaths.remove(at: candidate)
         }
     }
+    private
+    var isCancelled = false
+    private var frameCount = 0 {
+        didSet {
+            progress.completedUnitCount = Int64(frameCount)
+            compressProgressing?(progress)
+        }
+    }
     
+    public var compressProgressing: ((Progress) -> Void)?
+   private var progress = Progress()
     // MARK: - Private methods
     private func _compress(asset: AVAsset,
                            fileType: AVFileType,
@@ -330,6 +344,15 @@ public class FYVideoCompressor {
                                                                             kCVPixelFormatType_32BGRA])
         let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
         videoInput.transform = videoTrack.preferredTransform // fix output video orientation
+        // Total Frames
+        let durationInSeconds = asset.duration.seconds
+        let frameRate = videoTrack.nominalFrameRate
+        let totalFrames = ceil(durationInSeconds * Double(frameRate))
+        
+        // Progress
+        let totalUnits = Int64(totalFrames)
+        progress = Progress(totalUnitCount: totalUnits)
+        frameCount = .zero
         do {
             guard FileManager.default.isValidDirectory(atPath: outputPath) else {
                 completion(.failure(VideoCompressorError.outputPathNotValid(outputPath)))
@@ -404,8 +427,14 @@ public class FYVideoCompressor {
             // output audio
             if let realAudioInput = audioInput, let realAudioOutput = audioOutput {
                 group.enter()
-                realAudioInput.requestMediaDataWhenReady(on: audioCompressQueue) {
+                realAudioInput.requestMediaDataWhenReady(on: audioCompressQueue) { [weak self] in
+                    guard let self else { return }
                     while realAudioInput.isReadyForMoreMediaData {
+                        if self.isCancelled {
+                            realAudioInput.markAsFinished()
+                            self.group.leave()
+                            return
+                        }
                         if let buffer = realAudioOutput.copyNextSampleBuffer() {
                             realAudioInput.append(buffer)
                         } else {
@@ -419,7 +448,13 @@ public class FYVideoCompressor {
             }
             
             // completion
-            group.notify(queue: .main) {
+            group.notify(queue: .main) { [weak self] in
+                if self?.isCancelled == true {
+                    self?.writer?.cancelWriting()
+                    self?.reader?.cancelReading()
+                    completion(.failure(NSError(domain: "Cancelled", code: 1)))
+                    return
+                }
                 switch writer.status {
                 case .writing, .completed:
                     writer.finishWriting {
@@ -436,7 +471,7 @@ public class FYVideoCompressor {
                         }
                     }
                 default:
-                    completion(.failure(writer.error!))
+                    completion(.failure(writer.error ?? NSError(domain: "Unknown", code: 1)))
                 }
             }
             
@@ -502,8 +537,18 @@ AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: bitrate,
         var counter = 0
         var index = 0
         
-        videoInput.requestMediaDataWhenReady(on: videoCompressQueue) {
+        videoInput.requestMediaDataWhenReady(on: videoCompressQueue) { [weak self] in
+            guard let self else {
+                completion()
+                return
+            }
             while videoInput.isReadyForMoreMediaData {
+                if self.isCancelled {
+                    videoInput.markAsFinished()
+                    completion()
+                    break
+                }
+                self.frameCount += 1
                 if let buffer = videoOutput.copyNextSampleBuffer() {
                     // append first frame
                     if index < randomFrames.count {
@@ -548,8 +593,16 @@ AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: bitrate,
                          videoOutput: AVAssetReaderTrackOutput,
                          completion: @escaping(() -> Void)) {
         // Loop Video Frames
-        videoInput.requestMediaDataWhenReady(on: videoCompressQueue) {
+        frameCount = .zero
+        videoInput.requestMediaDataWhenReady(on: videoCompressQueue) { [weak self] in
+            guard let self = self else { return }
             while videoInput.isReadyForMoreMediaData {
+                if self.isCancelled {
+                    videoInput.markAsFinished()
+                    completion()
+                    return
+                }
+                self.frameCount += 1
                 if let vBuffer = videoOutput.copyNextSampleBuffer(), CMSampleBufferDataIsReady(vBuffer) {
                     videoInput.append(vBuffer)
                 } else {
